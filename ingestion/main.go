@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"io"
 	"errors"
+	"time"
 )
 
 var plaidClient *plaid.APIClient
@@ -43,7 +44,7 @@ func main() {
 	r.Post("/link/token", handleCreateLinkToken)
 	r.Post("/link/exchange", handleExchangePublicToken)
 	r.Post("/dev/sandbox-link", handleSandboxLink)
-	r.Get("/dev/sync-transactions", handleSyncTransactions)
+	r.Post("/dev/sync-transactions", handleSyncTransactions)
 
 	log.Println("listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -193,11 +194,68 @@ func handleSyncTransactions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stored := 0
+	for _, txn := range resp.GetAdded() {
+		if err := storeTransaction(ctx, itemID, txn); err != nil {
+			http.Error(w, "failed to store transaction "+txn.GetTransactionId()+": "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stored++
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"added":    resp.GetAdded(),
+		"stored":   stored,
 		"has_more": resp.GetHasMore(),
 	})
+}
+
+func storeTransaction(ctx context.Context, itemID string, txn plaid.Transaction) error {
+	rawPayload, err := json.Marshal(txn)
+	if err != nil {
+		return err
+	}
+	// Get the merchant name from the transaction, if it's not set, use the name of the transaction
+	merchantName := txn.GetMerchantName()
+	if merchantName == "" {
+		merchantName = txn.GetName()
+	}
+
+	pfc := txn.GetPersonalFinanceCategory()
+	category := pfc.GetPrimary()
+
+	transactionDate, err := time.Parse("2006-01-02", txn.GetDate())
+	if err != nil {
+		return err
+	}
+
+	_, err = dbPool.Exec(ctx,
+		`INSERT INTO transactions (
+			item_id, account_id, plaid_transaction_id, raw_payload,
+			amount, iso_currency_code, merchant_name, category,
+			transaction_date, pending, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+		ON CONFLICT (plaid_transaction_id) DO UPDATE SET
+			raw_payload = EXCLUDED.raw_payload,
+			amount = EXCLUDED.amount,
+			iso_currency_code = EXCLUDED.iso_currency_code,
+			merchant_name = EXCLUDED.merchant_name,
+			category = EXCLUDED.category,
+			transaction_date = EXCLUDED.transaction_date,
+			pending = EXCLUDED.pending,
+			updated_at = now()`,
+		itemID,
+		txn.GetAccountId(),
+		txn.GetTransactionId(),
+		rawPayload,
+		txn.GetAmount(),
+		txn.GetIsoCurrencyCode(),
+		merchantName,
+		category,
+		transactionDate,
+		txn.GetPending(),
+	)
+	return err
 }
 
 func encrypt(plaintext []byte) ([]byte, error) {
