@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/joho/godotenv"
 	"github.com/plaid/plaid-go/v46/plaid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,15 +39,17 @@ func main() {
 	configuration.UseEnvironment(plaid.Sandbox)
 	plaidClient = plaid.NewAPIClient(configuration)
 
-	http.HandleFunc("/link/token", handleCreateLinkToken)
-	http.HandleFunc("/link/exchange", handleExchangePublicToken)
-	http.HandleFunc("/dev/sandbox-link", handleSandboxLink)
+	r := chi.NewRouter() // r is a chi router
+	r.Post("/link/token", handleCreateLinkToken)
+	r.Post("/link/exchange", handleExchangePublicToken)
+	r.Post("/dev/sandbox-link", handleSandboxLink)
+	r.Get("/dev/sync-transactions", handleSyncTransactions)
 
 	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
-func handleCreateLinkToken(w http.ResponseWriter, r *http.Request) {
+func handleCreateLinkToken(w http.ResponseWriter, r *http.Request) { // r is request here
 	ctx := context.Background()
 
 	user := plaid.LinkTokenCreateRequestUser{
@@ -167,6 +170,36 @@ func handleSandboxLink(w http.ResponseWriter, r *http.Request) {
 		"status":  "linked",
 	})
 }
+func handleSyncTransactions(w http.ResponseWriter, r *http.Request) {
+	itemID := r.URL.Query().Get("item_id")
+	if itemID == "" {
+		http.Error(w, "item_id query param required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+	accessToken, err := getAccessToken(ctx, itemID)
+	if err != nil {
+		http.Error(w, "failed to get access token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	request := plaid.NewTransactionsSyncRequest(accessToken)
+	resp, _, err := plaidClient.PlaidApi.TransactionsSync(ctx).
+		TransactionsSyncRequest(*request).
+		Execute()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"added":    resp.GetAdded(),
+		"has_more": resp.GetHasMore(),
+	})
+}
+
 func encrypt(plaintext []byte) ([]byte, error) {
 	key, err := base64.StdEncoding.DecodeString(os.Getenv("ENCRYPTION_KEY"))
 	if err != nil {
