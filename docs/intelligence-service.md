@@ -4,7 +4,7 @@ Phase 5: the Python service that consumes the events Go has been publishing sinc
 
 ## Where it lives
 
-`intelligence/` at the repo root — sibling to `ingestion/`, its own package, its own `.env` (`intelligence/.env`, gitignored). Shares the root `venv/` and `requirements.txt` rather than a second virtualenv, since this repo only has one Python service so far.
+`intelligence/` at the repo root — sibling to `ingestion/`, its own package, its own `.env` (`intelligence/.env`, gitignored), its own `venv/` and `requirements.txt` — self-contained the same way `ingestion/` owns its own `go.mod`/`go.sum`, matching the README's "independently deployable services" framing.
 
 **Deliberately its own `.env`, not shared with Go's**: Python only gets `DATABASE_URL`, `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID` — never the Plaid credentials or `ENCRYPTION_KEY` Go uses. Same least-privilege reasoning behind splitting the two services into independently deployable units in the first place.
 

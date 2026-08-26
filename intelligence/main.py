@@ -1,9 +1,11 @@
 """FastAPI entry point. Run with:
 
-    venv/bin/uvicorn intelligence.main:app --reload
+    intelligence/venv/bin/uvicorn intelligence.main:app --reload
 
-from the repo root — the Kafka consumer starts automatically as a background
-task when the app starts, and stops cleanly when it shuts down.
+from the repo root (the venv lives inside intelligence/, but the command
+still runs from the root so Python resolves the `intelligence` package
+correctly) — the Kafka consumer starts automatically as a background task
+when the app starts, and stops cleanly when it shuts down.
 """
 import asyncio
 import logging
