@@ -8,7 +8,7 @@ import (
 	"encoding/json" // lets us convert a Go struct into JSON bytes (json.Marshal)
 	"time"          // lets us parse a plain date string into a real date/time value
 
-	"github.com/jackc/pgx/v5/pgxpool" // the Postgres driver/connection-pool library we use
+	"github.com/jackc/pgx/v5/pgxpool"     // the Postgres driver/connection-pool library we use
 	"github.com/plaid/plaid-go/v46/plaid" // needed because SaveTransaction takes a plaid.Transaction
 
 	// Our own crypto package, imported by its module path. This is how one of our own

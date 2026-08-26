@@ -5,13 +5,13 @@ package crypto
 // Go groups imports in one block. These are all from Go's standard library —
 // nothing here is a third-party dependency.
 import (
-	"crypto/aes"       // implements the AES cipher algorithm itself
-	"crypto/cipher"    // generic cipher interfaces, including GCM (the mode we use on top of AES)
-	"crypto/rand"      // a cryptographically secure random number source (NOT math/rand, which is not secure)
-	"encoding/base64"  // lets us turn our base64-text encryption key back into raw bytes
-	"errors"           // lets us create simple custom error values with errors.New(...)
-	"io"               // gives us io.ReadFull, used to fill a byte slice completely from a reader
-	"os"               // lets us read environment variables like ENCRYPTION_KEY
+	"crypto/aes"      // implements the AES cipher algorithm itself
+	"crypto/cipher"   // generic cipher interfaces, including GCM (the mode we use on top of AES)
+	"crypto/rand"     // a cryptographically secure random number source (NOT math/rand, which is not secure)
+	"encoding/base64" // lets us turn our base64-text encryption key back into raw bytes
+	"errors"          // lets us create simple custom error values with errors.New(...)
+	"io"              // gives us io.ReadFull, used to fill a byte slice completely from a reader
+	"os"              // lets us read environment variables like ENCRYPTION_KEY
 )
 
 // Encrypt takes plaintext bytes (e.g. a Plaid access_token) and returns them encrypted.

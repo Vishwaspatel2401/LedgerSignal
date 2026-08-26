@@ -16,6 +16,7 @@ import (
 	// Our own packages, referenced by their full module path
 	// (module name "ledgersignal/ingestion", from go.mod, plus the folder path).
 	"ledgersignal/ingestion/internal/api"
+	kafkaproducer "ledgersignal/ingestion/internal/kafka"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/storage"
 	"ledgersignal/ingestion/internal/worker"
@@ -57,17 +58,22 @@ func main() {
 	// in practice here, that means "close the DB pool cleanly when the program shuts down."
 	defer db.Close()
 
+	// Build the Kafka producer once. KAFKA_BROKERS/KAFKA_TOPIC are plain
+	// config (not secrets), read the same way as everything else in .env.
+	producer := kafkaproducer.NewProducer(os.Getenv("KAFKA_BROKERS"), os.Getenv("KAFKA_TOPIC"))
+	defer producer.Close()
+
 	// Build the background worker pool. The handler function passed in is a
-	// closure — an inline function that "closes over" (captures) plaidClient and
-	// db from this surrounding scope, so every worker can call the real sync
-	// logic without needing a Server instance at all.
+	// closure — an inline function that "closes over" (captures) plaidClient,
+	// db, and producer from this surrounding scope, so every worker can call
+	// the real sync logic without needing a Server instance at all.
 	pool := worker.NewPool(syncWorkerCount, syncQueueSize, syncMaxAttempts, syncBaseDelay, func(ctx context.Context, job worker.Job) error {
-		_, _, err := api.SyncItemTransactions(ctx, plaidClient, db, job.ItemID)
+		_, _, err := api.SyncItemTransactions(ctx, plaidClient, db, producer, job.ItemID)
 		return err
 	})
 
 	// Bundle every dependency into one Server, which every handler method will use.
-	srv := api.NewServer(plaidClient, db, pool)
+	srv := api.NewServer(plaidClient, db, pool, producer)
 
 	// Create a new chi router — this is what matches an incoming request's
 	// method + path to the correct handler function.

@@ -100,7 +100,7 @@ func CreateSandboxPublicToken(ctx context.Context, client *plaid.APIClient) (str
 	resp, _, err := client.PlaidApi.SandboxPublicTokenCreate(ctx).
 		SandboxPublicTokenCreateRequest(
 			*plaid.NewSandboxPublicTokenCreateRequest(
-				"ins_109508",                             // Plaid's canonical Sandbox test bank
+				"ins_109508", // Plaid's canonical Sandbox test bank
 				[]plaid.Products{plaid.PRODUCTS_TRANSACTIONS}, // which Plaid products to simulate
 			),
 		).Execute()

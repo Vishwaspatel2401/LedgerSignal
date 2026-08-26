@@ -8,11 +8,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/plaid/plaid-go/v46/plaid"
 
 	"ledgersignal/ingestion/internal/crypto"
+	"ledgersignal/ingestion/internal/events"
+	kafkaproducer "ledgersignal/ingestion/internal/kafka"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/storage"
 	"ledgersignal/ingestion/internal/worker"
@@ -22,28 +25,35 @@ import (
 // Instead of global variables that any function could reach into from anywhere,
 // each handler gets these through this one struct — this is "dependency injection."
 type Server struct {
-	Plaid *plaid.APIClient // the configured Plaid client
-	DB    *pgxpool.Pool    // the Postgres connection pool
-	Pool  *worker.Pool     // the background worker pool — fed by HandleWebhook
+	Plaid    *plaid.APIClient        // the configured Plaid client
+	DB       *pgxpool.Pool           // the Postgres connection pool
+	Pool     *worker.Pool            // the background worker pool — fed by HandleWebhook
+	Producer *kafkaproducer.Producer // publishes normalized transaction events to Kafka
 }
 
 // NewServer is a "constructor" — a function whose only job is building a Server
 // with its dependencies already filled in, so callers never build one by hand.
-func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool) *Server {
+func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool, producer *kafkaproducer.Producer) *Server {
 	// &Server{...} creates a Server struct and immediately takes its address (&),
 	// returning a pointer. We return a pointer so every handler method below shares
 	// the exact same Server instance (and therefore the same DB pool/Plaid client),
 	// rather than each accidentally getting its own separate copy.
-	return &Server{Plaid: plaidClient, DB: db, Pool: pool}
+	return &Server{Plaid: plaidClient, DB: db, Pool: pool, Producer: producer}
 }
 
 // SyncItemTransactions is the actual "pull transactions and store them" logic,
 // pulled out of HandleSyncTransactions so it isn't tied to any HTTP request.
 // It's a plain function (not a Server method) so it can be called two ways:
-// directly from a Server method (passing s.Plaid, s.DB), or from a worker pool's
-// HandlerFunc closure in main.go, which has its own references to the same
-// plaidClient/db without needing a Server at all.
-func SyncItemTransactions(ctx context.Context, plaidClient *plaid.APIClient, db *pgxpool.Pool, itemID string) (stored int, hasMore bool, err error) {
+// directly from a Server method (passing s.Plaid, s.DB, s.Producer), or from a
+// worker pool's HandlerFunc closure in main.go, which has its own references
+// to the same dependencies without needing a Server at all.
+//
+// As of Phase 4, every successfully stored transaction is also published to
+// Kafka as a NormalizedTransactionEvent. If publishing fails, this function
+// returns the error just like a DB or Plaid failure would — which means the
+// worker pool's existing retry-with-backoff logic (Phase 3) automatically
+// covers Kafka publish failures too, with no new retry code needed here.
+func SyncItemTransactions(ctx context.Context, plaidClient *plaid.APIClient, db *pgxpool.Pool, producer *kafkaproducer.Producer, itemID string) (stored int, hasMore bool, err error) {
 	accessToken, err := storage.GetAccessToken(ctx, db, itemID)
 	if err != nil {
 		return 0, false, err
@@ -58,10 +68,43 @@ func SyncItemTransactions(ctx context.Context, plaidClient *plaid.APIClient, db 
 		if err := storage.SaveTransaction(ctx, db, itemID, txn); err != nil {
 			return stored, hasMore, err
 		}
+
+		if err := publishTransactionEvent(ctx, producer, txn); err != nil {
+			return stored, hasMore, err
+		}
+
 		stored++
 	}
 
 	return stored, hasMore, nil
+}
+
+// publishTransactionEvent builds a NormalizedTransactionEvent from one raw
+// Plaid transaction and publishes it. Kept separate from SyncItemTransactions
+// just to keep that function's main loop readable.
+func publishTransactionEvent(ctx context.Context, producer *kafkaproducer.Producer, txn plaid.Transaction) error {
+	rawPayload, err := json.Marshal(txn)
+	if err != nil {
+		return err
+	}
+
+	// The event's timestamp is the transaction's own date, not "when this
+	// event was published" — Python needs to know when the financial event
+	// actually happened, not when Go happened to process it.
+	transactionDate, err := time.Parse("2006-01-02", txn.GetDate())
+	if err != nil {
+		return err
+	}
+
+	event := events.NormalizedTransactionEvent{
+		AccountID:          txn.GetAccountId(),
+		PlaidTransactionID: txn.GetTransactionId(),
+		RawPayload:         rawPayload,
+		NormalizedAmount:   txn.GetAmount(),
+		Timestamp:          transactionDate,
+	}
+
+	return producer.Publish(ctx, event)
 }
 
 // (s *Server) before the function name makes this a "method" — a function attached
@@ -185,7 +228,7 @@ func (s *Server) HandleSyncTransactions(w http.ResponseWriter, r *http.Request) 
 
 	// All the real work now lives in SyncItemTransactions, shared with the
 	// worker pool — this handler is just the HTTP wrapper around it.
-	stored, hasMore, err := SyncItemTransactions(r.Context(), s.Plaid, s.DB, itemID)
+	stored, hasMore, err := SyncItemTransactions(r.Context(), s.Plaid, s.DB, s.Producer, itemID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

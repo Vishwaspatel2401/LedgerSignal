@@ -1,8 +1,8 @@
 package crypto
 
 import (
-	"bytes"        // bytes.Equal compares two []byte slices for equality
-	"crypto/rand"  // secure randomness, used here to generate a throwaway test key
+	"bytes"       // bytes.Equal compares two []byte slices for equality
+	"crypto/rand" // secure randomness, used here to generate a throwaway test key
 	"encoding/base64"
 	"testing" // Go's built-in testing package — no third-party test library needed
 )
