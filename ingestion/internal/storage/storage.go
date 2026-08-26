@@ -8,6 +8,8 @@ import (
 	"encoding/json" // lets us convert a Go struct into JSON bytes (json.Marshal)
 	"time"          // lets us parse a plain date string into a real date/time value
 
+	"github.com/jackc/pgx/v5"             // for the pgx.Row type used in the DBPool interface below
+	"github.com/jackc/pgx/v5/pgconn"      // for pgconn.CommandTag, Exec's result type
 	"github.com/jackc/pgx/v5/pgxpool"     // the Postgres driver/connection-pool library we use
 	"github.com/plaid/plaid-go/v46/plaid" // needed because SaveTransaction takes a plaid.Transaction
 
@@ -15,6 +17,18 @@ import (
 	// internal packages calls another — same mechanism as importing a third-party library.
 	"ledgersignal/ingestion/internal/crypto"
 )
+
+// DBPool is the narrow slice of *pgxpool.Pool's methods that this package
+// actually uses. Every function below takes this interface instead of the
+// concrete *pgxpool.Pool type — *pgxpool.Pool already has matching Exec and
+// QueryRow methods, so it satisfies this interface automatically, meaning no
+// caller anywhere else in the project needs to change. What this buys us:
+// tests can pass in a small hand-written fake instead of a real database
+// connection, since the fake only needs to implement these two methods.
+type DBPool interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // NewPool creates a connection pool to Postgres, given a full connection string
 // (like postgres://user:pass@host:port/dbname). A "pool" means many queries can run
@@ -27,7 +41,7 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 }
 
 // SaveItem stores (or updates) one linked account's encrypted access token.
-func SaveItem(ctx context.Context, pool *pgxpool.Pool, itemID string, encryptedToken []byte) error {
+func SaveItem(ctx context.Context, pool DBPool, itemID string, encryptedToken []byte) error {
 	// pool.Exec runs a SQL statement that doesn't return rows (an INSERT, here).
 	// The backtick-quoted string is a "raw string literal" in Go — it can span multiple
 	// lines and doesn't need escape characters, which is why we use it for SQL.
@@ -45,7 +59,7 @@ func SaveItem(ctx context.Context, pool *pgxpool.Pool, itemID string, encryptedT
 
 // GetAccessToken looks up an item's encrypted token by item_id, decrypts it,
 // and returns the real, usable access_token as a plain string.
-func GetAccessToken(ctx context.Context, pool *pgxpool.Pool, itemID string) (string, error) {
+func GetAccessToken(ctx context.Context, pool DBPool, itemID string) (string, error) {
 	// Declares a variable to hold the raw encrypted bytes we're about to read from the DB.
 	// `var encrypted []byte` starts it as nil/empty; QueryRow below will fill it in.
 	var encrypted []byte
@@ -74,7 +88,7 @@ func GetAccessToken(ctx context.Context, pool *pgxpool.Pool, itemID string) (str
 
 // SaveTransaction takes one raw Plaid transaction, normalizes the fields worth normalizing,
 // and writes both the raw and normalized versions into the transactions table.
-func SaveTransaction(ctx context.Context, pool *pgxpool.Pool, itemID string, txn plaid.Transaction) error {
+func SaveTransaction(ctx context.Context, pool DBPool, itemID string, txn plaid.Transaction) error {
 	// json.Marshal converts the whole `txn` struct back into JSON bytes — this becomes
 	// the untouched raw_payload column, preserving every field Plaid sent us.
 	rawPayload, err := json.Marshal(txn)
