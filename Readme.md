@@ -190,6 +190,18 @@ LedgerSignal is scoped around that shift, and around a second, complementary pro
 
 ---
 
+## 8a. Plaid-Aligned Add-Ons
+
+Plaid's own engineering org (per their Effects 2026 announcements and engineering blog) is currently investing in: foundation models trained on transaction data for categorization/income classification, measured accuracy improvements backing those claims, and MCP support so AI agents can query/act on their data directly. The three add-ons below aren't generic ML polish — each one deliberately mirrors one of those specific, current priorities, and each plugs into a phase already in this plan rather than requiring new infrastructure.
+
+|Add-On|Mirrors|Where It Plugs In|
+|---|---|---|
+|**Income Classification**|Plaid cited a 48% income-classification accuracy improvement as a headline win at Effects 2026|Phase 6 — an extra field on the existing Claude enrichment call: when a transaction is a credit, classify it as salary / gig income / transfer / refund / other|
+|**Categorization Evaluation Suite**|Plaid backs its accuracy claims (13% categorization, 48% income) with measured numbers, not vibes|Phase 6 — hand-label ~30–40 Sandbox transactions with ground-truth categories, run the Claude categorizer against them, report real accuracy (same evaluation-suite pattern used for Sentinel's incident classification, applied here to a new domain)|
+|**MCP Server over LedgerSignal**|Plaid is actively shipping MCP support so AI agents (Claude, Cursor, Codex) can query/act on Plaid data directly, without a human engineer per request|Phase 6 — a natural sibling to the NL Query Interface: expose tools like `get_transaction_risk_summary`, `query_spending_by_category`, `get_flagged_transactions` so an MCP client (e.g. Claude Desktop) can query the pipeline live|
+
+---
+
 ## 9. Key Design Decisions (Why, Not Just What)
 
 This section exists to make sure every non-obvious architectural choice has a clear, defensible rationale — the kind of thing an interviewer will ask "why did you do it this way?" about.
