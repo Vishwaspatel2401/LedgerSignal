@@ -5,6 +5,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -14,6 +15,7 @@ import (
 	"ledgersignal/ingestion/internal/crypto"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/storage"
+	"ledgersignal/ingestion/internal/worker"
 )
 
 // Server holds every dependency our handlers need to do their job.
@@ -22,16 +24,44 @@ import (
 type Server struct {
 	Plaid *plaid.APIClient // the configured Plaid client
 	DB    *pgxpool.Pool    // the Postgres connection pool
+	Pool  *worker.Pool     // the background worker pool — fed by HandleWebhook
 }
 
 // NewServer is a "constructor" — a function whose only job is building a Server
 // with its dependencies already filled in, so callers never build one by hand.
-func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool) *Server {
+func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool) *Server {
 	// &Server{...} creates a Server struct and immediately takes its address (&),
 	// returning a pointer. We return a pointer so every handler method below shares
 	// the exact same Server instance (and therefore the same DB pool/Plaid client),
 	// rather than each accidentally getting its own separate copy.
-	return &Server{Plaid: plaidClient, DB: db}
+	return &Server{Plaid: plaidClient, DB: db, Pool: pool}
+}
+
+// SyncItemTransactions is the actual "pull transactions and store them" logic,
+// pulled out of HandleSyncTransactions so it isn't tied to any HTTP request.
+// It's a plain function (not a Server method) so it can be called two ways:
+// directly from a Server method (passing s.Plaid, s.DB), or from a worker pool's
+// HandlerFunc closure in main.go, which has its own references to the same
+// plaidClient/db without needing a Server at all.
+func SyncItemTransactions(ctx context.Context, plaidClient *plaid.APIClient, db *pgxpool.Pool, itemID string) (stored int, hasMore bool, err error) {
+	accessToken, err := storage.GetAccessToken(ctx, db, itemID)
+	if err != nil {
+		return 0, false, err
+	}
+
+	added, hasMore, err := plaidclient.SyncTransactions(ctx, plaidClient, accessToken)
+	if err != nil {
+		return 0, false, err
+	}
+
+	for _, txn := range added {
+		if err := storage.SaveTransaction(ctx, db, itemID, txn); err != nil {
+			return stored, hasMore, err
+		}
+		stored++
+	}
+
+	return stored, hasMore, nil
 }
 
 // (s *Server) before the function name makes this a "method" — a function attached
@@ -153,37 +183,12 @@ func (s *Server) HandleSyncTransactions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ctx := r.Context()
-	// Look up this item's real access_token (already decrypted for us by this call).
-	accessToken, err := storage.GetAccessToken(ctx, s.DB, itemID)
+	// All the real work now lives in SyncItemTransactions, shared with the
+	// worker pool — this handler is just the HTTP wrapper around it.
+	stored, hasMore, err := SyncItemTransactions(r.Context(), s.Plaid, s.DB, itemID)
 	if err != nil {
-		// string concatenation with `+` builds a more specific error message,
-		// including the underlying error's own text.
-		http.Error(w, "failed to get access token: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	// Ask Plaid for this account's transactions.
-	added, hasMore, err := plaidclient.SyncTransactions(ctx, s.Plaid, accessToken)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// A running counter of how many transactions we successfully stored.
-	stored := 0
-	// `for _, txn := range added` loops over every element in the `added` slice.
-	// `_` throws away the index (we don't need "which position in the list"),
-	// `txn` is the current transaction on each pass through the loop.
-	for _, txn := range added {
-		if err := storage.SaveTransaction(ctx, s.DB, itemID, txn); err != nil {
-			// If even one transaction fails to save, stop immediately and report which
-			// one failed, rather than silently skipping it or storing a partial result.
-			http.Error(w, "failed to store transaction "+txn.GetTransactionId()+": "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// `stored++` increments the counter by one — shorthand for `stored = stored + 1`.
-		stored++
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -193,4 +198,102 @@ func (s *Server) HandleSyncTransactions(w http.ResponseWriter, r *http.Request) 
 		"stored":   stored,
 		"has_more": hasMore,
 	})
+}
+
+// HandleWebhook is the real endpoint Plaid calls automatically — no curl, no
+// manual trigger. It's intentionally tiny: parse just enough of the payload to
+// know what happened, hand off any real work to the worker pool, and respond
+// fast. Plaid expects webhook receivers to acknowledge quickly; slow or
+// blocking work here would risk Plaid treating the delivery as failed and
+// retrying it unnecessarily.
+func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
+	// We only care about three fields out of everything Plaid might send, so
+	// we decode into a small anonymous struct with just those — any other
+	// fields in the JSON body (there are more, depending on webhook_type) are
+	// simply ignored by the decoder rather than causing an error.
+	var payload struct {
+		WebhookType string `json:"webhook_type"`
+		WebhookCode string `json:"webhook_code"`
+		ItemID      string `json:"item_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
+		return
+	}
+
+	// Plaid sends many different webhook_type/webhook_code combinations (item
+	// errors, auth events, etc.) — for now we only act on the one that means
+	// "new transaction data is ready to sync." Everything else is acknowledged
+	// with a 200 and otherwise ignored; we're not handling those cases yet.
+	if payload.WebhookType == "TRANSACTIONS" && payload.WebhookCode == "SYNC_UPDATES_AVAILABLE" {
+		// Enqueue returns almost immediately (it just places the job on a
+		// channel) — the actual Plaid API call and database writes happen
+		// later, on a worker goroutine, well after this function has returned.
+		s.Pool.Enqueue(worker.Job{ItemID: payload.ItemID})
+	}
+
+	// Respond 200 regardless of webhook_type/webhook_code — this just tells
+	// Plaid "delivery received," not "processing finished."
+	w.WriteHeader(http.StatusOK)
+}
+
+// HandleSetWebhook is a dev-only endpoint that tells Plaid where to send
+// webhooks for a given item — needed once, so Plaid's real servers know our
+// (temporary, ngrok-tunneled) public URL.
+func (s *Server) HandleSetWebhook(w http.ResponseWriter, r *http.Request) {
+	itemID := r.URL.Query().Get("item_id")
+	if itemID == "" {
+		http.Error(w, "item_id query param required", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		WebhookURL string `json:"webhook_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.WebhookURL == "" {
+		http.Error(w, "webhook_url required in request body", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	// The access_token never leaves this function — it's fetched, used, and
+	// discarded, same discipline as every other handler that touches it.
+	accessToken, err := storage.GetAccessToken(ctx, s.DB, itemID)
+	if err != nil {
+		http.Error(w, "failed to get access token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := plaidclient.UpdateWebhook(ctx, s.Plaid, accessToken, body.WebhookURL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// HandleFireWebhook is a dev-only endpoint that asks Plaid to actually send a
+// real webhook for a given item — from Plaid's own servers, to whatever URL
+// was set via HandleSetWebhook. This is the real end-to-end test: unlike our
+// earlier synthetic curl payloads, this webhook genuinely comes from Plaid.
+func (s *Server) HandleFireWebhook(w http.ResponseWriter, r *http.Request) {
+	itemID := r.URL.Query().Get("item_id")
+	if itemID == "" {
+		http.Error(w, "item_id query param required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	accessToken, err := storage.GetAccessToken(ctx, s.DB, itemID)
+	if err != nil {
+		http.Error(w, "failed to get access token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := plaidclient.FireSandboxWebhook(ctx, s.Plaid, accessToken, "SYNC_UPDATES_AVAILABLE"); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }

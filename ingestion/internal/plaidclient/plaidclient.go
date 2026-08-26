@@ -131,3 +131,29 @@ func SyncTransactions(ctx context.Context, client *plaid.APIClient, accessToken 
 	// resp.GetHasMore() tells us whether there's a further page we haven't fetched yet.
 	return resp.GetAdded(), resp.GetHasMore(), nil
 }
+
+// UpdateWebhook tells Plaid which URL to POST webhooks to for a given item —
+// this is what makes Plaid's servers actually able to reach ours, instead of
+// us only ever reaching out to Plaid.
+func UpdateWebhook(ctx context.Context, client *plaid.APIClient, accessToken, webhookURL string) error {
+	request := plaid.NewItemWebhookUpdateRequest(accessToken)
+	request.SetWebhook(webhookURL)
+
+	_, _, err := client.PlaidApi.ItemWebhookUpdate(ctx).
+		ItemWebhookUpdateRequest(*request).
+		Execute()
+	return err
+}
+
+// FireSandboxWebhook asks Plaid to actually send a real webhook — from Plaid's
+// own servers, over the real internet — to whatever URL was set via
+// UpdateWebhook. This is Sandbox-only; it's how we test the real delivery path
+// without waiting for a webhook to happen to fire naturally.
+func FireSandboxWebhook(ctx context.Context, client *plaid.APIClient, accessToken, webhookCode string) error {
+	request := plaid.NewSandboxItemFireWebhookRequest(accessToken, webhookCode)
+
+	_, _, err := client.PlaidApi.SandboxItemFireWebhook(ctx).
+		SandboxItemFireWebhookRequest(*request).
+		Execute()
+	return err
+}

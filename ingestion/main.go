@@ -8,6 +8,7 @@ import (
 	"log"      // simple logging to the terminal
 	"net/http" // Go's standard library HTTP server
 	"os"       // lets us read environment variables
+	"time"     // lets us express the retry backoff delay
 
 	"github.com/go-chi/chi/v5" // our HTTP router (matches routes to handlers, enforces verbs)
 	"github.com/joho/godotenv" // loads variables from a .env file into the environment
@@ -17,6 +18,18 @@ import (
 	"ledgersignal/ingestion/internal/api"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/storage"
+	"ledgersignal/ingestion/internal/worker"
+)
+
+// How many goroutines process background sync jobs concurrently, how many
+// jobs can queue up before Enqueue starts blocking, and the retry behavior
+// for jobs that fail. Small, deliberately conservative numbers for now —
+// easy to tune once there's real load to measure.
+const (
+	syncWorkerCount = 3
+	syncQueueSize   = 10
+	syncMaxAttempts = 3               // total tries per job, including the first
+	syncBaseDelay   = 2 * time.Second // doubles each retry: 2s, 4s, ...
 )
 
 func main() {
@@ -44,8 +57,17 @@ func main() {
 	// in practice here, that means "close the DB pool cleanly when the program shuts down."
 	defer db.Close()
 
-	// Bundle both dependencies into one Server, which every handler method will use.
-	srv := api.NewServer(plaidClient, db)
+	// Build the background worker pool. The handler function passed in is a
+	// closure — an inline function that "closes over" (captures) plaidClient and
+	// db from this surrounding scope, so every worker can call the real sync
+	// logic without needing a Server instance at all.
+	pool := worker.NewPool(syncWorkerCount, syncQueueSize, syncMaxAttempts, syncBaseDelay, func(ctx context.Context, job worker.Job) error {
+		_, _, err := api.SyncItemTransactions(ctx, plaidClient, db, job.ItemID)
+		return err
+	})
+
+	// Bundle every dependency into one Server, which every handler method will use.
+	srv := api.NewServer(plaidClient, db, pool)
 
 	// Create a new chi router — this is what matches an incoming request's
 	// method + path to the correct handler function.
@@ -59,6 +81,9 @@ func main() {
 	r.Post("/link/exchange", srv.HandleExchangePublicToken)
 	r.Post("/dev/sandbox-link", srv.HandleSandboxLink)
 	r.Post("/dev/sync-transactions", srv.HandleSyncTransactions)
+	r.Post("/webhooks/plaid", srv.HandleWebhook)
+	r.Post("/dev/set-webhook", srv.HandleSetWebhook)
+	r.Post("/dev/fire-webhook", srv.HandleFireWebhook)
 
 	log.Println("listening on :8080")
 	// http.ListenAndServe starts the actual web server on port 8080, using our
