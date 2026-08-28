@@ -1,17 +1,22 @@
 // This is the entry point of the program — every Go executable needs exactly one
 // package named "main" with exactly one func main() inside it. This file does almost
-// no real work itself anymore; it just wires together the pieces built in internal/.
+// no real work itself; it just wires together the pieces built in internal/.
 package main
 
 import (
 	"context"
+	"embed"    // lets us bundle the migrations/*.sql files into the compiled binary
+	"errors"   // lets us compare against migrate.ErrNoChange
 	"log"      // simple logging to the terminal
 	"net/http" // Go's standard library HTTP server
 	"os"       // lets us read environment variables
 	"time"     // lets us express the retry backoff delay
 
 	"github.com/go-chi/chi/v5" // our HTTP router (matches routes to handlers, enforces verbs)
-	"github.com/joho/godotenv" // loads variables from a .env file into the environment
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres" // registers the "postgres"/"postgresql" URL scheme
+	"github.com/golang-migrate/migrate/v4/source/iofs"         // lets migrate read migrations from an embed.FS
+	"github.com/joho/godotenv"                                 // loads variables from a .env file into the environment
 
 	// Our own packages, referenced by their full module path
 	// (module name "ledgersignal/ingestion", from go.mod, plus the folder path).
@@ -21,6 +26,35 @@ import (
 	"ledgersignal/ingestion/internal/storage"
 	"ledgersignal/ingestion/internal/worker"
 )
+
+// Embedding the migrations directory into the binary means a deployed build
+// carries its own schema definitions — no separate copy of migrations/ has to
+// be shipped alongside it, and there's no dependency on the process's working
+// directory to find them (relevant for Phase 9's move off a local machine).
+//
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// runMigrations applies every not-yet-applied migration in migrations/ against
+// databaseURL, in order, on startup — the automated replacement for manually
+// running `migrate` by hand once per phase. migrate.ErrNoChange just means the
+// schema was already up to date; that's success, not a failure to report.
+func runMigrations(databaseURL string) error {
+	source, err := iofs.New(migrationsFS, "migrations")
+	if err != nil {
+		return err
+	}
+
+	m, err := migrate.NewWithSourceInstance("iofs", source, databaseURL)
+	if err != nil {
+		return err
+	}
+
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return err
+	}
+	return nil
+}
 
 // How many goroutines process background sync jobs concurrently, how many
 // jobs can queue up before Enqueue starts blocking, and the retry behavior
@@ -40,6 +74,13 @@ func main() {
 	// this just logs a message and continues — it's not treated as fatal.
 	if err := godotenv.Load(); err != nil {
 		log.Println("no .env file found, relying on real env vars")
+	}
+
+	// Apply any pending schema migrations before anything else touches Postgres —
+	// a fresh database (or one a phase behind) gets brought up to date automatically
+	// instead of requiring someone to run `migrate` by hand first.
+	if err := runMigrations(os.Getenv("DATABASE_URL")); err != nil {
+		log.Fatal("failed to apply migrations: ", err)
 	}
 
 	// Build our Plaid client once, using credentials read from the environment.
