@@ -10,7 +10,8 @@ from sqlalchemy.dialects.postgresql import insert
 
 from . import config
 from .db import SessionLocal
-from .models import RiskSignal
+from .enrichment import enrich_transaction
+from .models import RiskSignal, Transaction
 from .risk_engine import score_transaction
 from .schemas import NormalizedTransactionEvent
 
@@ -69,6 +70,19 @@ def _process_event(event: NormalizedTransactionEvent) -> None:
     with SessionLocal() as session:
         assessment = score_transaction(session, event)
 
+        # Phase 6: best-effort Claude enrichment, layered on top of the rule
+        # engine's result above — never blocks or fails this function if it
+        # errors (see enrichment.py's own docstring). Re-queries the
+        # Transaction row rather than threading it through score_transaction,
+        # to avoid changing that function's tested signature for a feature
+        # that's additive to its output, not part of its logic.
+        txn = (
+            session.query(Transaction)
+            .filter(Transaction.plaid_transaction_id == event.plaid_transaction_id)
+            .one()
+        )
+        enrichment = enrich_transaction(txn, assessment)
+
         # Idempotent upsert — same discipline as Go's ON CONFLICT pattern.
         # Re-processing the same event (e.g. after a consumer restart before
         # the last offset commit) updates the row instead of erroring or
@@ -78,6 +92,8 @@ def _process_event(event: NormalizedTransactionEvent) -> None:
             risk_score=assessment.score,
             risk_level=assessment.level,
             reasons=assessment.reasons,
+            risk_summary=enrichment.summary,
+            income_classification=enrichment.income_classification,
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=[RiskSignal.plaid_transaction_id],
@@ -85,6 +101,8 @@ def _process_event(event: NormalizedTransactionEvent) -> None:
                 "risk_score": assessment.score,
                 "risk_level": assessment.level,
                 "reasons": assessment.reasons,
+                "risk_summary": enrichment.summary,
+                "income_classification": enrichment.income_classification,
                 "updated_at": func.now(),
             },
         )

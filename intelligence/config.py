@@ -20,3 +20,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 KAFKA_BROKERS = os.environ["KAFKA_BROKERS"]
 KAFKA_TOPIC = os.environ["KAFKA_TOPIC"]
 KAFKA_GROUP_ID = os.environ["KAFKA_GROUP_ID"]
+
+# Phase 6 — Claude-powered enrichment (risk summaries, income classification).
+# Read with .get, not os.environ[...]: an empty/missing key shouldn't crash
+# the whole service on startup — enrichment.py checks for it and skips
+# enrichment gracefully instead, so the rule-based scoring path (Phase 5)
+# keeps working even before this is configured.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

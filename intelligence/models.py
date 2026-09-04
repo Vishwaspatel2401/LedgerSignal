@@ -44,5 +44,11 @@ class RiskSignal(Base):
     risk_score = Column(Numeric(5, 2), nullable=False)
     risk_level = Column(String, nullable=False)
     reasons = Column(JSONB, nullable=False, default=list)
+    # Phase 6 additions — populated by enrichment.py's Claude call, alongside
+    # (not instead of) the rule engine's score/level/reasons above. Nullable
+    # because rows scored before Phase 6 shipped won't have these until
+    # they're re-enriched.
+    risk_summary = Column(String)
+    income_classification = Column(String)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
