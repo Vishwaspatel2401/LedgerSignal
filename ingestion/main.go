@@ -23,6 +23,7 @@ import (
 	"ledgersignal/ingestion/internal/api"
 	kafkaproducer "ledgersignal/ingestion/internal/kafka"
 	"ledgersignal/ingestion/internal/plaidclient"
+	"ledgersignal/ingestion/internal/ratelimit"
 	"ledgersignal/ingestion/internal/storage"
 	"ledgersignal/ingestion/internal/worker"
 )
@@ -65,6 +66,14 @@ const (
 	syncQueueSize   = 10
 	syncMaxAttempts = 3               // total tries per job, including the first
 	syncBaseDelay   = 2 * time.Second // doubles each retry: 2s, 4s, ...
+
+	// Protects the webhook endpoint (see docs/caveats.md — its signature
+	// isn't verified yet) from a burst of fake deliveries filling the
+	// worker pool's queue and blocking HandleWebhook itself. Generous
+	// enough that real Plaid webhook bursts are never affected: 10 allowed
+	// immediately, refilling at 2 more per second after that.
+	webhookRateLimitBurst     = 10
+	webhookRateLimitPerSecond = 2
 )
 
 func main() {
@@ -128,7 +137,11 @@ func main() {
 	r.Post("/link/exchange", srv.HandleExchangePublicToken)
 	r.Post("/dev/sandbox-link", srv.HandleSandboxLink)
 	r.Post("/dev/sync-transactions", srv.HandleSyncTransactions)
-	r.Post("/webhooks/plaid", srv.HandleWebhook)
+	// r.With(...) scopes the rate limiter to just this one route — every
+	// other handler is untouched, since none of them are reachable by
+	// anyone but you.
+	webhookLimiter := ratelimit.NewBucket(webhookRateLimitBurst, webhookRateLimitPerSecond)
+	r.With(ratelimit.Middleware(webhookLimiter)).Post("/webhooks/plaid", srv.HandleWebhook)
 	r.Post("/dev/set-webhook", srv.HandleSetWebhook)
 	r.Post("/dev/fire-webhook", srv.HandleFireWebhook)
 
