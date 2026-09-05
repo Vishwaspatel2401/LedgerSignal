@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/plaid/plaid-go/v46/plaid"
 
+	"ledgersignal/ingestion/internal/audit"
 	"ledgersignal/ingestion/internal/crypto"
 	"ledgersignal/ingestion/internal/events"
 	kafkaproducer "ledgersignal/ingestion/internal/kafka"
@@ -32,16 +33,17 @@ type Server struct {
 	DB       *pgxpool.Pool           // the Postgres connection pool
 	Pool     *worker.Pool            // the background worker pool — fed by HandleWebhook
 	Producer *kafkaproducer.Producer // publishes normalized transaction events to Kafka
+	Audit    *audit.Logger           // persistent log of security-relevant events
 }
 
 // NewServer is a "constructor" — a function whose only job is building a Server
 // with its dependencies already filled in, so callers never build one by hand.
-func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool, producer *kafkaproducer.Producer) *Server {
+func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool, producer *kafkaproducer.Producer, auditLogger *audit.Logger) *Server {
 	// &Server{...} creates a Server struct and immediately takes its address (&),
 	// returning a pointer. We return a pointer so every handler method below shares
 	// the exact same Server instance (and therefore the same DB pool/Plaid client),
 	// rather than each accidentally getting its own separate copy.
-	return &Server{Plaid: plaidClient, DB: db, Pool: pool, Producer: producer}
+	return &Server{Plaid: plaidClient, DB: db, Pool: pool, Producer: producer, Audit: auditLogger}
 }
 
 // fetchWebhookVerificationKey adapts plaidclient.GetWebhookVerificationKey
@@ -178,6 +180,7 @@ func (s *Server) HandleExchangePublicToken(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "failed to store item", http.StatusInternalServerError)
 		return
 	}
+	s.Audit.Log(ctx, "item_linked", itemID, map[string]any{"via": "exchange_public_token"})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -218,6 +221,7 @@ func (s *Server) HandleSandboxLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to store item", http.StatusInternalServerError)
 		return
 	}
+	s.Audit.Log(ctx, "item_linked", itemID, map[string]any{"via": "sandbox_shortcut"})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -274,7 +278,14 @@ func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := webhookverify.Verify(r.Context(), s.fetchWebhookVerificationKey, r.Header.Get("Plaid-Verification"), rawBody); err != nil {
 		// Logged, not returned to the caller — telling a forger exactly
 		// which check failed would just help them craft a better forgery.
+		// The audit record gets the full reason though: unlike the HTTP
+		// response, this is for US to investigate later, not for whoever
+		// sent the request.
 		log.Printf("rejected webhook: %v", err)
+		s.Audit.Log(r.Context(), "webhook_rejected", "", map[string]any{
+			"reason":      err.Error(),
+			"remote_addr": r.RemoteAddr,
+		})
 		http.Error(w, "webhook verification failed", http.StatusUnauthorized)
 		return
 	}
@@ -292,6 +303,11 @@ func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
 		return
 	}
+
+	s.Audit.Log(r.Context(), "webhook_accepted", payload.ItemID, map[string]any{
+		"webhook_type": payload.WebhookType,
+		"webhook_code": payload.WebhookCode,
+	})
 
 	// Plaid sends many different webhook_type/webhook_code combinations (item
 	// errors, auth events, etc.) — for now we only act on the one that means

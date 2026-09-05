@@ -75,10 +75,18 @@ func (b *Bucket) Allow() bool {
 // Middleware wraps an http.Handler so a request is only passed through if
 // the bucket allows it — otherwise it's rejected with 429 before the real
 // handler (and everything it would have done, like Enqueue) ever runs.
-func Middleware(bucket *Bucket) func(http.Handler) http.Handler {
+//
+// onRejected is called (if non-nil) for every rejected request, before the
+// 429 is written — the hook for a caller that wants to record rejections
+// somewhere (an audit log, a metric) without this package needing to know
+// what Postgres or any other storage even is. Pass nil if you don't need one.
+func Middleware(bucket *Bucket, onRejected func(*http.Request)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !bucket.Allow() {
+				if onRejected != nil {
+					onRejected(r)
+				}
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

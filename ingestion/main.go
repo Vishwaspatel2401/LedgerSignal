@@ -21,6 +21,7 @@ import (
 	// Our own packages, referenced by their full module path
 	// (module name "ledgersignal/ingestion", from go.mod, plus the folder path).
 	"ledgersignal/ingestion/internal/api"
+	"ledgersignal/ingestion/internal/audit"
 	kafkaproducer "ledgersignal/ingestion/internal/kafka"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/ratelimit"
@@ -113,6 +114,10 @@ func main() {
 	producer := kafkaproducer.NewProducer(os.Getenv("KAFKA_BROKERS"), os.Getenv("KAFKA_TOPIC"))
 	defer producer.Close()
 
+	// Persistent, queryable log of security-relevant events — same pool as
+	// everything else, no separate connection needed.
+	auditLogger := audit.NewLogger(db)
+
 	// Build the background worker pool. The handler function passed in is a
 	// closure — an inline function that "closes over" (captures) plaidClient,
 	// db, and producer from this surrounding scope, so every worker can call
@@ -123,7 +128,7 @@ func main() {
 	})
 
 	// Bundle every dependency into one Server, which every handler method will use.
-	srv := api.NewServer(plaidClient, db, pool, producer)
+	srv := api.NewServer(plaidClient, db, pool, producer, auditLogger)
 
 	// Create a new chi router — this is what matches an incoming request's
 	// method + path to the correct handler function.
@@ -139,9 +144,17 @@ func main() {
 	r.Post("/dev/sync-transactions", srv.HandleSyncTransactions)
 	// r.With(...) scopes the rate limiter to just this one route — every
 	// other handler is untouched, since none of them are reachable by
-	// anyone but you.
+	// anyone but you. The rejection hook records a burst of throttled
+	// requests to the same audit trail as accepted/rejected webhooks — a
+	// flood of 429s is exactly the kind of thing worth being able to find
+	// later, not just something that disappears once the burst is over.
 	webhookLimiter := ratelimit.NewBucket(webhookRateLimitBurst, webhookRateLimitPerSecond)
-	r.With(ratelimit.Middleware(webhookLimiter)).Post("/webhooks/plaid", srv.HandleWebhook)
+	rateLimitMiddleware := ratelimit.Middleware(webhookLimiter, func(req *http.Request) {
+		auditLogger.Log(req.Context(), "webhook_rate_limited", "", map[string]any{
+			"remote_addr": req.RemoteAddr,
+		})
+	})
+	r.With(rateLimitMiddleware).Post("/webhooks/plaid", srv.HandleWebhook)
 	r.Post("/dev/set-webhook", srv.HandleSetWebhook)
 	r.Post("/dev/fire-webhook", srv.HandleFireWebhook)
 
