@@ -51,6 +51,20 @@ class EnrichmentResult:
 INCOME_CATEGORIES = ["salary", "gig_income", "transfer", "refund", "other"]
 
 
+def _strip_code_fence(text: str) -> str:
+    """Claude reliably wraps JSON replies in a ```json ... ``` fence even
+    when explicitly told to reply with only JSON — a well-known model habit,
+    not something a stricter prompt reliably stops. Stripping it here is
+    more robust than fighting the model with prompt wording."""
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    lines = lines[1:]  # drop the opening ``` or ```json line
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def enrich_transaction(txn: Transaction, assessment: RiskAssessment) -> EnrichmentResult:
     """Best-effort enrichment for one transaction. Never raises — a failure
     here should be logged and skipped, not take down the caller."""
@@ -94,7 +108,7 @@ Reply with ONLY a JSON object, no other text:
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw_text = response.content[0].text.strip()
+        raw_text = _strip_code_fence(response.content[0].text.strip())
         parsed = json.loads(raw_text)
     except Exception:
         logger.exception(
