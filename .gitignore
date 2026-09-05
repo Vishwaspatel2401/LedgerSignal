@@ -2,7 +2,8 @@ ingestion/.env
 intelligence/.env
 __pycache__/
 *.pyc
-docs/my_understanding.md docs/DesignPatterns.md
+docs/my_understanding.md
+docs/DesignPatterns.md
 docs/architecture.md
 docs/audit-log.md
 docs/bugs.md
