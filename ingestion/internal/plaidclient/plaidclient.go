@@ -157,3 +157,17 @@ func FireSandboxWebhook(ctx context.Context, client *plaid.APIClient, accessToke
 		Execute()
 	return err
 }
+
+// GetWebhookVerificationKey fetches Plaid's public key for one key ID (a
+// "kid" pulled from an incoming webhook's Plaid-Verification header) — the
+// key webhookverify.Verify checks that header's signature against. See
+// https://plaid.com/docs/api/webhooks/webhook-verification/.
+func GetWebhookVerificationKey(ctx context.Context, client *plaid.APIClient, keyID string) (plaid.JWKPublicKey, error) {
+	resp, _, err := client.PlaidApi.WebhookVerificationKeyGet(ctx).
+		WebhookVerificationKeyGetRequest(*plaid.NewWebhookVerificationKeyGetRequest(keyID)).
+		Execute()
+	if err != nil {
+		return plaid.JWKPublicKey{}, err
+	}
+	return resp.GetKey(), nil
+}

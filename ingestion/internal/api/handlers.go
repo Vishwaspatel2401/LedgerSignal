@@ -7,6 +7,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	kafkaproducer "ledgersignal/ingestion/internal/kafka"
 	"ledgersignal/ingestion/internal/plaidclient"
 	"ledgersignal/ingestion/internal/storage"
+	"ledgersignal/ingestion/internal/webhookverify"
 	"ledgersignal/ingestion/internal/worker"
 )
 
@@ -39,6 +42,14 @@ func NewServer(plaidClient *plaid.APIClient, db *pgxpool.Pool, pool *worker.Pool
 	// the exact same Server instance (and therefore the same DB pool/Plaid client),
 	// rather than each accidentally getting its own separate copy.
 	return &Server{Plaid: plaidClient, DB: db, Pool: pool, Producer: producer}
+}
+
+// fetchWebhookVerificationKey adapts plaidclient.GetWebhookVerificationKey
+// (which needs s.Plaid) to webhookverify.KeyFetcher's plain function shape —
+// this method value (s.fetchWebhookVerificationKey, no parentheses) is what
+// gets passed into webhookverify.Verify below.
+func (s *Server) fetchWebhookVerificationKey(ctx context.Context, keyID string) (plaid.JWKPublicKey, error) {
+	return plaidclient.GetWebhookVerificationKey(ctx, s.Plaid, keyID)
 }
 
 // SyncItemTransactions is the actual "pull transactions and store them" logic,
@@ -244,12 +255,30 @@ func (s *Server) HandleSyncTransactions(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleWebhook is the real endpoint Plaid calls automatically — no curl, no
-// manual trigger. It's intentionally tiny: parse just enough of the payload to
-// know what happened, hand off any real work to the worker pool, and respond
-// fast. Plaid expects webhook receivers to acknowledge quickly; slow or
-// blocking work here would risk Plaid treating the delivery as failed and
-// retrying it unnecessarily.
+// manual trigger. It's intentionally tiny: verify it's genuinely from Plaid,
+// parse just enough of the payload to know what happened, hand off any real
+// work to the worker pool, and respond fast. Plaid expects webhook receivers
+// to acknowledge quickly; slow or blocking work here would risk Plaid
+// treating the delivery as failed and retrying it unnecessarily.
 func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
+	// Read the raw bytes ourselves, rather than json.NewDecoder(r.Body)
+	// straight away — webhookverify.Verify needs the exact raw body to hash
+	// and compare against the verification JWT's own claim, which a decoder
+	// that's already consumed and parsed the stream can't hand back.
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := webhookverify.Verify(r.Context(), s.fetchWebhookVerificationKey, r.Header.Get("Plaid-Verification"), rawBody); err != nil {
+		// Logged, not returned to the caller — telling a forger exactly
+		// which check failed would just help them craft a better forgery.
+		log.Printf("rejected webhook: %v", err)
+		http.Error(w, "webhook verification failed", http.StatusUnauthorized)
+		return
+	}
+
 	// We only care about three fields out of everything Plaid might send, so
 	// we decode into a small anonymous struct with just those — any other
 	// fields in the JSON body (there are more, depending on webhook_type) are
@@ -259,7 +288,7 @@ func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		WebhookCode string `json:"webhook_code"`
 		ItemID      string `json:"item_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
 		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
 		return
 	}
