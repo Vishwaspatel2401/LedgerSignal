@@ -4,13 +4,13 @@ Real tradeoffs, deferred work, and things worth being deliberate about later —
 
 ---
 
-## Plaid webhook signature is not verified
+## ~~Plaid webhook signature is not verified~~ — Resolved, Phase 8
 
-**Where:** `internal/api/handlers.go`, `HandleWebhook` (Phase 3)
+**Where:** `internal/api/handlers.go`, `HandleWebhook` (flagged Phase 3, fixed Phase 8)
 
-Plaid signs every real webhook with a `Plaid-Verification` JWT header — confirmed present on a real webhook delivery during Phase 3 testing (via `ngrok`'s request log). `HandleWebhook` currently ignores it completely. That means anyone who discovers the webhook URL could `POST` a fake `SYNC_UPDATES_AVAILABLE` payload with an arbitrary `item_id` and trigger a real sync — fine for local Sandbox development, not fine the moment this is ever exposed publicly.
+Plaid signs every real webhook with a `Plaid-Verification` JWT header — confirmed present on a real webhook delivery during Phase 3 testing (via `ngrok`'s request log). `HandleWebhook` used to ignore it completely, meaning anyone who discovered the webhook URL could `POST` a fake `SYNC_UPDATES_AVAILABLE` payload with an arbitrary `item_id` and trigger a real sync.
 
-**Deferred to:** Phase 8 (security hardening), by original plan — not forgotten, just not yet done.
+**Fix:** `internal/webhookverify` now implements Plaid's documented verification algorithm — the header's JWT signature is checked against Plaid's published key (`plaidclient.GetWebhookVerificationKey`, cached by `kid`), rejected if older than 5 minutes, and the JWT's `request_body_sha256` claim is compared against the actual request body so a valid signature on a tampered body still fails. Covered by `webhookverify_test.go`, which signs a JWT with a throwaway key to prove both the accept and reject paths — not just that garbage input fails, which a broken implementation would also do. Paired with the rate limiter added the same session (`internal/ratelimit`), which protects the worker queue from a burst even before signature checking rejects it.
 
 ---
 
