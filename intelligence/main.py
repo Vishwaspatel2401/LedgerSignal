@@ -12,8 +12,11 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from .consumer import consume_forever
+from .db import SessionLocal
+from .nl_query import answer_question
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,3 +42,27 @@ app = FastAPI(title="LedgerSignal Intelligence Service", lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+class QueryResponse(BaseModel):
+    answer: str
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    """The NL query interface — ask a plain-English question about risk
+    signals or spending, get a plain-English answer back. Runs the blocking
+    Claude + DB work on a separate thread via asyncio.to_thread, same reason
+    consumer.py does it for _process_event: this is a synchronous call
+    stack (anthropic's SDK, SQLAlchemy) inside an async server, and running
+    it inline would block every other request this server is handling."""
+    def _run() -> str:
+        with SessionLocal() as session:
+            return answer_question(session, request.question)
+
+    answer = await asyncio.to_thread(_run)
+    return QueryResponse(answer=answer)
