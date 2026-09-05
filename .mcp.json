@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ledgersignal": {
+      "command": "/Users/vishwaspatel/LinkVault/intelligence/venv/bin/python",
+      "args": ["-m", "intelligence.mcp_server"],
+      "cwd": "/Users/vishwaspatel/LinkVault"
+    }
+  }
+}
